@@ -1,0 +1,389 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_USER="name-cho"
+REPO_NAME="Chistore"
+BRANCH="main"
+BASE_URL="https://github.com/${REPO_USER}/${REPO_NAME}/raw/branch/${BRANCH}"
+
+CHISTORE_URL="${BASE_URL}/chistore"
+CHISTORE_VER_URL="${BASE_URL}/VERSION"
+INDEX_URL="${BASE_URL}/INDEX"
+
+LOCAL_VER="1.5.2"
+XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+XDG_BIN_HOME="${XDG_BIN_HOME:-$HOME/.local/bin}"
+STATE_DIR="$XDG_DATA_HOME/chistore"
+MANIFEST="$STATE_DIR/manifest"
+INSTALL_DIR="$XDG_BIN_HOME"
+VENV_DIR="$STATE_DIR/venv"
+
+mkdir -p "$STATE_DIR" "$INSTALL_DIR"
+
+R=$'\033[0m' G=$'\033[92m' Y=$'\033[93m' C=$'\033[96m' B=$'\033[1m'
+
+ok() { printf "${G}[+]${R} %s\n" "$1"; }
+warn() { printf "${Y}[!]${R} %s\n" "$1" >&2; }
+err() { printf "${R}[x]${R} %s\n" "$1" >&2; }
+info() { printf "${C}[i]${R} %s\n" "$1"; }
+
+confirm() {
+    printf "${B}%s${R} [y/N] " "$1"
+    read -r ans
+    [[ "${ans,,}" =~ ^y(es)?$ ]]
+}
+
+parse_field_md() {
+    local key="$1" md="$2" val
+    val=$(printf '%s\n' "$md" | grep -iE "^#+[[:space:]]+${key}[[:space:]]*:" | head -1 | sed -E "s/^#+[[:space:]]+[^:]+:[[:space:]]*//" | xargs)
+    echo "${val:-}"
+}
+
+self_update() {
+    [ "${_CH_UPDATED:-0}" = "1" ] && return 0
+    local remote_ver
+    remote_ver=$(curl -fsSL --connect-timeout 5 --max-time 10 "$CHISTORE_VER_URL" 2>/dev/null || echo "err")
+    [ "$remote_ver" = "$LOCAL_VER" ] && return 0
+    [ "$remote_ver" = "err" ] && return 0
+    info "Update available: $LOCAL_VER -> $remote_ver"
+    confirm "Update chistore?" || return 0
+    local tmp
+    tmp=$(mktemp "$INSTALL_DIR/chistore.XXXXXX")
+    curl -fsSL --connect-timeout 5 --max-time 15 "$CHISTORE_URL" -o "$tmp" || { rm -f "$tmp"; err "Download failed"; return 1; }
+    chmod +x "$tmp"
+    mv -f "$tmp" "$0"
+    export _CH_UPDATED=1
+    exec "$0" "$@"
+}
+
+setup_python_venv() {
+    [ -f "$VENV_DIR/bin/pip" ] && return 0
+    info "Initializing global Python venv..."
+    python3 -m venv "$VENV_DIR" >/dev/null 2>&1
+    "$VENV_DIR/bin/pip" install --upgrade pip -q >/dev/null 2>&1
+    ok "Python venv ready at $VENV_DIR"
+}
+
+get_pkg_manager() {
+    if command -v pacman &>/dev/null; then echo "pacman -S --noconfirm"
+    elif command -v apt &>/dev/null; then echo "apt install -y"
+    elif command -v dnf &>/dev/null; then echo "dnf install -y"
+    elif command -v apk &>/dev/null; then echo "apk add"
+    elif command -v brew &>/dev/null; then echo "brew install"
+    else echo ""; fi
+}
+
+check_sys_pkg() {
+    local check_pkg="$1"
+    if command -v pacman &>/dev/null; then pacman -Q "$check_pkg" &>/dev/null
+    elif command -v dpkg &>/dev/null; then dpkg-query -W -f='${Status}' "$check_pkg" 2>/dev/null | grep -q "install ok installed"
+    elif command -v rpm &>/dev/null; then rpm -q "$check_pkg" &>/dev/null
+    elif command -v apk &>/dev/null; then apk info -e "$check_pkg" &>/dev/null
+    elif command -v brew &>/dev/null; then brew list --versions "$check_pkg" &>/dev/null
+    else return 1; fi
+}
+
+install_deps() {
+    local deps_str="$1"
+    local -a sys_deps=() pip_deps=() npm_deps=()
+
+    for token in $deps_str; do
+        local dep_type="sys" dep_pkgs="$token"
+        if [[ "$token" == *":"* ]]; then dep_type="${token%%:*}"; dep_pkgs="${token#*:}"; fi
+        IFS=',' read -ra pkg_list <<< "$dep_pkgs"
+        for dep_pkg in "${pkg_list[@]}"; do
+            [[ -z "$dep_pkg" ]] && continue
+            case "$dep_type" in
+                sys|pacman|apt|dnf) sys_deps+=("$dep_pkg") ;;
+                pip|python) pip_deps+=("$dep_pkg") ;;
+                npm|node) npm_deps+=("$dep_pkg") ;;
+                *) sys_deps+=("$dep_pkg") ;;
+            esac
+        done
+    done
+
+    local -a to_install=()
+    for sys_pkg in "${sys_deps[@]}"; do
+        if check_sys_pkg "$sys_pkg"; then ok "Already installed: $sys_pkg"
+        else to_install+=("$sys_pkg"); fi
+    done
+
+    if [ ${#to_install[@]} -eq 0 ] && [ ${#pip_deps[@]} -eq 0 ] && [ ${#npm_deps[@]} -eq 0 ]; then return 0; fi
+
+    echo -e "\n${B}📦 Required Dependencies:${R}"
+    [ ${#to_install[@]} -gt 0 ] && echo -e "  ${C}System:${R} ${to_install[*]}"
+    [ ${#pip_deps[@]} -gt 0 ] && echo -e "  ${C}Python (venv):${R} ${pip_deps[*]}"
+    [ ${#npm_deps[@]} -gt 0 ] && echo -e "  ${C}Node:${R} ${npm_deps[*]}"
+    echo ""
+
+    confirm "Install dependencies?" || return 1
+
+    if [ ${#to_install[@]} -gt 0 ]; then
+        local pm; pm=$(get_pkg_manager)
+        [ -z "$pm" ] && { err "No package manager found."; return 1; }
+        info "Installing system packages..."
+        sudo $pm "${to_install[@]}" || { err "System deps failed"; return 1; }
+    fi
+
+    if [ ${#pip_deps[@]} -gt 0 ]; then
+        setup_python_venv
+        info "Installing Python packages to venv..."
+        "$VENV_DIR/bin/pip" install "${pip_deps[@]}" || { err "pip install failed"; return 1; }
+    fi
+
+    if [ ${#npm_deps[@]} -gt 0 ]; then
+        info "Installing Node packages..."
+        npm install -g "${npm_deps[@]}" || { err "npm install failed"; return 1; }
+    fi
+    ok "Dependencies resolved."
+}
+
+fetch_binary() {
+    local fb_pkg="$1" fb_main="$2" fb_dest="$3"
+    local -a urls=("$BASE_URL/$fb_pkg/$fb_main")
+    [[ "$fb_main" != *.py ]] && urls+=("$BASE_URL/$fb_pkg/${fb_main}.py")
+
+    for fb_url in "${urls[@]}"; do
+        if curl -fsSL "$fb_url" -o "$fb_dest"; then return 0; fi
+    done
+
+    echo -e "\n${Y}⚠️  Failed URLs:${R}"
+    for fb_url in "${urls[@]}"; do echo "  ${C}•${R} $fb_url"; done
+    return 1
+}
+
+create_python_wrapper() {
+    local wrap_bin="$1" wrap_data="$2" wrap_main="$3"
+    cat > "$wrap_bin" <<WEOF
+#!/usr/bin/env bash
+exec "$VENV_DIR/bin/python3" "$wrap_data/$wrap_main" "\$@"
+WEOF
+    chmod +x "$wrap_bin"
+}
+
+cmd_help() {
+    cat <<EOF
+${B}chistore${R} - CLI tool manager
+
+${B}Usage:${R}
+  chistore -h        Show help
+  chistore -Ss <q>   Search repository
+  chistore -S <pkg>  Install package
+  chistore -Syu      System upgrade
+  chistore -Rn <pkg> Remove (keep configs & data)
+  chistore -Rns <pkg> Remove fully (purge)
+  chistore -Qet      List installed
+  chistore -Qs <q>   Search installed
+EOF
+}
+
+cmd_search() {
+    local q="${1:-}"
+    info "Searching repository: ${B}${q}${R}"
+    local idx
+    idx=$(curl -fsSL --connect-timeout 5 "$INDEX_URL") || { err "Cannot fetch INDEX"; exit 1; }
+    local found=0
+    while IFS= read -r line; do
+        [[ -z "$line" || "$line" =~ ^# ]] && continue
+        [[ "${line,,}" == *"${q,,}"* ]] || continue
+        local md n d v s t m author homepage src
+        md=$(curl -fsSL "$BASE_URL/$line/info.md" 2>/dev/null) || continue
+        n=$(parse_field_md "Name" "$md"); d=$(parse_field_md "Description" "$md")
+        v=$(parse_field_md "Version" "$md"); s=$(parse_field_md "Size" "$md")
+        t=$(parse_field_md "Type" "$md"); m=$(parse_field_md "MainFile" "$md")
+        author=$(parse_field_md "Author" "$md"); homepage=$(parse_field_md "Homepage" "$md")
+        src="$BASE_URL/$line"
+        n=${n:-$line}; d=${d:-No description}; v=${v:-?}; s=${s:-?}
+        echo -e "${G}${n}${R} v${v} | ${s} [${t:-single}]"
+        echo -e "  ${d}"
+        [ -n "$author" ] && [ "$author" != "Unknown" ] && echo -e "  ${C}by ${author}${R}"
+        echo ""
+        ((found++)) || true
+    done <<< "$idx"
+    [ "$found" -eq 0 ] && warn "No packages found."
+}
+
+cmd_install() {
+    local pkg="$1"
+    local idx
+    idx=$(curl -fsSL --connect-timeout 5 "$INDEX_URL") || { err "Index unavailable"; exit 1; }
+    grep -qx "$pkg" <<< "$idx" || { err "Package not in repository"; exit 1; }
+    local md n d v s t m deps author homepage src
+    md=$(curl -fsSL "$BASE_URL/$pkg/info.md") || { err "Cannot fetch info.md"; exit 1; }
+    n=$(parse_field_md "Name" "$md"); d=$(parse_field_md "Description" "$md")
+    v=$(parse_field_md "Version" "$md"); s=$(parse_field_md "Size" "$md")
+    t=$(parse_field_md "Type" "$md"); m=$(parse_field_md "MainFile" "$md")
+    deps=$(parse_field_md "Dependencies" "$md")
+    author=$(parse_field_md "Author" "$md"); homepage=$(parse_field_md "Homepage" "$md")
+    src="$BASE_URL/$pkg"
+    n=${n:-$pkg}; d=${d:-No description}; v=${v:-?}; s=${s:-?}; t=${t:-single}; m=${m:-$pkg}
+    deps=${deps:-}; author=${author:-Unknown}; homepage=${homepage:-none}
+
+    echo -e "\n${B}📦 Install: ${n}${R}"
+    echo -e "  Version: ${v}"
+    echo -e "  Size: ${s}"
+    echo -e "  Type: ${t}"
+    [ -n "$author" ] && [ "$author" != "Unknown" ] && echo -e "  Author: ${author}"
+    [ -n "$homepage" ] && [ "$homepage" != "none" ] && echo -e "  Homepage: ${homepage}"
+    [ -n "$src" ] && echo -e "  Source: ${src}"
+    echo -e "  Description: ${d}\n"
+    confirm "Install ${B}${pkg}${R}?" || { info "Cancelled"; return 0; }
+
+    if [ -n "$deps" ]; then install_deps "$deps" || { err "Dependency installation aborted."; exit 1; }; fi
+
+    local bin_path="$INSTALL_DIR/$pkg"
+    local conf_dir="$HOME/.config/$pkg"
+    local data_dir="$HOME/.local/share/$pkg"
+    mkdir -p "$data_dir" "$conf_dir"
+
+    if [ "$t" = "archive" ]; then
+        curl -fsSL "$BASE_URL/$pkg/${pkg}.tar.gz" | tar -xzf - -C "$data_dir" || { err "Extract failed"; exit 1; }
+        ln -sf "$data_dir/$m" "$bin_path"
+    elif [ "$t" = "python" ]; then
+        setup_python_venv
+        local tmp_file="$data_dir/.tmp_download"
+        fetch_binary "$pkg" "$m" "$tmp_file" || { err "Download failed"; exit 1; }
+        mv -f "$tmp_file" "$data_dir/$m"
+        chmod +x "$data_dir/$m"
+        create_python_wrapper "$bin_path" "$data_dir" "$m"
+    else
+        fetch_binary "$pkg" "$m" "$bin_path" || { err "Download failed"; exit 1; }
+        chmod +x "$bin_path"
+    fi
+
+    grep -v "^${pkg}|" "$MANIFEST" > "${MANIFEST}.tmp" 2>/dev/null || true
+    mv -f "${MANIFEST}.tmp" "$MANIFEST"
+    echo "${pkg}|${v}|${bin_path}|${conf_dir}|${data_dir}|$(date +%F)" >> "$MANIFEST"
+    ok "${pkg} installed"
+    [[ ":$PATH:" != *":$INSTALL_DIR:"* ]] && warn "Add $INSTALL_DIR to PATH"
+}
+
+cmd_syu() {
+    [ ! -s "$MANIFEST" ] && { info "No installed packages."; return 0; }
+    local -a upgrades=()
+    local idx
+    idx=$(curl -fsSL --connect-timeout 5 "$INDEX_URL") || { err "Cannot fetch INDEX"; exit 1; }
+
+    while IFS='|' read -r upg_pkg upg_ver upg_bin upg_cfg upg_data upg_date; do
+        grep -qx "$upg_pkg" <<< "$idx" || { warn "Remote index missing $upg_pkg. Skipping."; continue; }
+        local md remote_ver
+        md=$(curl -fsSL "$BASE_URL/$upg_pkg/info.md" 2>/dev/null) || continue
+        remote_ver=$(parse_field_md "Version" "$md")
+        remote_ver=${remote_ver:-$upg_ver}
+        if [ "$upg_ver" != "$remote_ver" ]; then upgrades+=("${upg_pkg}|${upg_ver}|${remote_ver}"); fi
+    done < "$MANIFEST"
+
+    if [ ${#upgrades[@]} -eq 0 ]; then info "All packages are up to date."; return 0; fi
+
+    echo -e "\n${B}📦 Available Upgrades:${R}"
+    for entry in "${upgrades[@]}"; do
+        IFS='|' read -r p curr next <<< "$entry"
+        echo -e "  ${G}${p}${R} ${curr} ${Y}→${R} ${C}${next}${R}"
+    done
+    echo ""
+
+    printf "${B}Skip packages (comma/space) or 'n' to cancel:${R} "
+    read -r skip_input
+    [[ "${skip_input,,}" == "n" ]] && { info "Upgrade cancelled."; return 0; }
+
+    local -a skip_list=()
+    [ -n "$skip_input" ] && IFS=', ' read -ra skip_list <<< "$skip_input"
+
+    for entry in "${upgrades[@]}"; do
+        IFS='|' read -r p curr next <<< "$entry"
+        local skip=false
+        for s in "${skip_list[@]}"; do [[ "$p" == "$s" ]] && { skip=true; break; }; done
+        $skip && { warn "Skipping $p"; continue; }
+
+        echo -e "${B}⬇️  Updating: ${p}${R} (${curr} → ${next})"
+        local md t m
+        md=$(curl -fsSL "$BASE_URL/$p/info.md")
+        t=$(parse_field_md "Type" "$md"); m=$(parse_field_md "MainFile" "$md")
+        t=${t:-single}; m=${m:-$p}
+
+        local bin_path="$INSTALL_DIR/$p"
+        local conf_dir="$HOME/.config/$p"
+        local data_dir="$HOME/.local/share/$p"
+        mkdir -p "$data_dir" "$conf_dir"
+
+        if [ "$t" = "archive" ]; then
+            curl -fsSL "$BASE_URL/$p/${p}.tar.gz" | tar -xzf - -C "$data_dir" || { err "Extract failed for $p"; continue; }
+            ln -sf "$data_dir/$m" "$bin_path"
+        elif [ "$t" = "python" ]; then
+            setup_python_venv
+            local tmp_file="$data_dir/.tmp_download"
+            fetch_binary "$p" "$m" "$tmp_file" || { err "Download failed for $p"; continue; }
+            mv -f "$tmp_file" "$data_dir/$m"
+            chmod +x "$data_dir/$m"
+            create_python_wrapper "$bin_path" "$data_dir" "$m"
+        else
+            fetch_binary "$p" "$m" "$bin_path" || { err "Download failed for $p"; continue; }
+            chmod +x "$bin_path"
+        fi
+
+        grep -v "^${p}|" "$MANIFEST" > "${MANIFEST}.tmp" 2>/dev/null || true
+        mv -f "${MANIFEST}.tmp" "$MANIFEST"
+        echo "${p}|${next}|${bin_path}|${conf_dir}|${data_dir}|$(date +%F)" >> "$MANIFEST"
+        ok "$p updated to ${next}"
+    done
+    echo -e "\n${G}🎉 System upgrade complete.${R}"
+}
+
+cmd_remove() {
+    local pkg="$1" purge="${2:-0}"
+    local line
+    line=$(grep "^${pkg}|" "$MANIFEST" 2>/dev/null) || { err "Not installed"; exit 1; }
+    IFS='|' read -r _ ver bin cfg data _ <<< "$line"
+    echo -e "\n${B}🗑️  Remove: ${pkg}${R}"
+    echo -e "  Version: ${ver}\n  Binary: ${bin}"
+    [ "$purge" = "1" ] && { echo -e "  ${C}Config:${R} ${cfg}"; echo -e "  ${C}Data:${R} ${data}"; }
+    confirm "${purge:+Fully }remove ${B}${pkg}${R}?" || { info "Cancelled"; return 0; }
+
+    rm -f "$bin"
+    ok "Binary removed."
+    if [ "$purge" = "1" ]; then
+        [ -d "$cfg" ] && rm -rf "$cfg" && ok "Config purged."
+        [ -d "$data" ] && rm -rf "$data" && ok "Data purged."
+    fi
+    grep -v "^${pkg}|" "$MANIFEST" > "${MANIFEST}.tmp" 2>/dev/null || true
+    mv -f "${MANIFEST}.tmp" "$MANIFEST"
+    ok "${pkg} removed."
+}
+
+cmd_list() {
+    [ ! -s "$MANIFEST" ] && { info "No installed tools."; return 0; }
+    echo -e "${B}📋 Installed:${R}"
+    while IFS='|' read -r pkg ver bin cfg data date; do
+        echo -e "  ${G}${pkg}${R} v${ver} | Installed: ${date}"
+    done < "$MANIFEST"
+}
+
+cmd_qsearch() {
+    local q="${1:-}"
+    [ ! -s "$MANIFEST" ] && { warn "None installed."; return 0; }
+    local found
+    found=$(grep -i "$q" "$MANIFEST" 2>/dev/null) || { warn "No installed packages match."; return 0; }
+    echo -e "${B}🔍 Installed (match: ${q}):${R}"
+    while IFS='|' read -r pkg ver bin cfg data date; do
+        echo -e "  ${G}${pkg}${R} v${ver}"
+    done <<< "$found"
+}
+
+main() {
+    self_update
+    warn "This Bash manager is archived. Install Chistore-go: https://gitgud.io/name-cho/Chistore-go"
+    [ $# -lt 1 ] && { cmd_help; exit 0; }
+    case "$1" in
+        -h|--help) cmd_help ;;
+        -Ss) cmd_search "${2:-}" ;;
+        -S) [ -z "${2:-}" ] && err "Package required" || cmd_install "$2" ;;
+        -Syu) cmd_syu ;;
+        -Rn) [ -z "${2:-}" ] && err "Package required" || cmd_remove "$2" 0 ;;
+        -Rns) [ -z "${2:-}" ] && err "Package required" || cmd_remove "$2" 1 ;;
+        -Qet) cmd_list ;;
+        -Qs) cmd_qsearch "${2:-}" ;;
+        *) err "Unknown: $1"; cmd_help; exit 1 ;;
+    esac
+}
+
+main "$@"
